@@ -56,7 +56,7 @@ fi
 
 echo "==> Creo utente di sistema '${APP_USER}' (se non esiste)..."
 if ! id -u "$APP_USER" &>/dev/null; then
-  useradd -m -s /bin/bash -c "OpenWA deploy user" "$APP_USER"
+  sudo useradd -m -s /bin/bash -c "OpenWA deploy user" "$APP_USER"
   echo "    Utente creato. Nessuna password di login impostata: si accede solo con 'su - ${APP_USER}' da root."
 else
   echo "    Utente ${APP_USER} gia' esistente, salto la creazione."

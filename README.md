@@ -22,8 +22,7 @@ Entrambi vanno eseguiti come **root**.
 │   ├── dist/               backend compilato
 │   └── data/               TUTTO LO STATO (vedi sotto)
 ├── OpenWA_old/             versione precedente, intatta, per il rollback
-├── OpenWA_failed_<data>/   (solo dopo un rollback automatico, da cancellare a mano)
-└── openwa-backups/         archivi di backup, uno per ogni aggiornamento
+└── OpenWA_failed_<data>/   (solo dopo un rollback automatico, da cancellare a mano)
 ```
 
 | Elemento | Valore |
@@ -52,7 +51,7 @@ Tutti i dati che non si possono ricreare stanno in `OpenWA/data/`:
 
 Oltre a `data/` servono `.env` ed `ecosystem.config.js`. Tutto il resto (codice, `node_modules`, `dist`) si ricrea da GitHub.
 
-> **Con `update-openwa.sh` a ogni aggiornamento si riparte puliti:** della cartella `data/` vengono conservati solo `main.sqlite` e `.api-key` (le API key). Vedi sezione 3.
+> **Con `update-openwa.sh` a ogni aggiornamento si riparte puliti:** la cartella `data/` viene ricreata vuota. La API key admin resta la stessa grazie a `API_MASTER_KEY` in `.env`. Vedi sezione 3.
 
 > Ordine di priorità della configurazione: variabili d'ambiente > `.env` > `data/.env.generated`.
 > Un valore scritto in `.env` vince sempre su quello impostato dalla dashboard.
@@ -122,16 +121,16 @@ Senza argomenti lo script cerca **l'ultima release pubblicata** su GitHub (tag `
 
 Lo script segue il runbook ufficiale del progetto (`docs/11-operational-runbooks.md`, "Version Upgrade"):
 
-0. **Controlla lo spazio su disco** prima di iniziare (circa 2 volte `data/` senza sessioni, più 1,5 GB). Tutti i file temporanei vanno in `/home/nodeapp/.openwa-tmp` invece che in `/tmp`.
+0. **Controlla lo spazio su disco** prima di iniziare (circa 1,5 GB). Tutti i file temporanei vanno in `/home/nodeapp/.openwa-tmp` invece che in `/tmp`.
 1. **Prepara la nuova versione mentre l'app vecchia gira ancora.** Clona la release in `OpenWA_new`, copia `.env` ed `ecosystem.config.js`, esegue `npm ci`, `npm run build` e `npm run dashboard:build`. Se qualcosa fallisce qui, la produzione non viene toccata.
-2. **Ferma l'app e fa il backup.** Usa lo script ufficiale `scripts/backup.sh` del progetto (installa `sqlite3` se manca, per una copia consistente dei database). L'archivio finisce in `/home/nodeapp/openwa-backups/`; vengono conservati gli ultimi 10.
-3. **Riparte pulito, tranne le API key.** Nella nuova versione vengono portati solo `data/main.sqlite` (API key e audit log) e `data/.api-key`, oltre a `.env` ed `ecosystem.config.js`. Tutto il resto viene ricreato vuoto: **sessioni** (da riabbinare con il QR), **webhook**, messaggi salvati, media, plugin e impostazioni salvate dalla dashboard (`data/.env.generated`). Le API key continuano a funzionare, ma quelle limitate a sessioni specifiche (`allowedSessions`) vanno aggiornate con gli id delle sessioni nuove. `OpenWA` viene rinominato in `OpenWA_old` senza toccarne i dati, quindi un rollback riporta tutto com'era, sessioni escluse.
+2. **Ferma l'app.** Non viene fatto nessun backup: la copia di sicurezza è `OpenWA_old`, che resta con i dati com'erano prima dell'aggiornamento.
+3. **Riparte pulito.** La nuova `data/` è vuota: nessun database viene copiato, quindi niente sessioni vecchie rimaste nel database senza i loro file. Vengono ricreati da zero **sessioni** (QR), **webhook**, messaggi, media, plugin, impostazioni della dashboard e **le API key create a mano**. La **API key admin** invece resta identica: lo script legge quella attuale da `data/.api-key` e la scrive in `.env` come `API_MASTER_KEY` (se non c'è già). Al primo avvio, trovando il database vuoto, OpenWA crea la chiave admin con quel valore. `OpenWA` viene rinominato in `OpenWA_old` senza toccarne i dati, quindi un rollback riporta tutto com'era, sessioni escluse.
 4. **Esegue le migrazioni del database** (`npm run migration:run:prod`) sulla copia.
 5. **Scambia le cartelle:** cancella il vecchio `OpenWA_old`, rinomina `OpenWA` in `OpenWA_old` e `OpenWA_new` in `OpenWA`.
 6. **Riavvia con PM2** e verifica `http://127.0.0.1:2785/api/health` per massimo 2 minuti.
 7. **Se l'app non risponde, torna da sola alla versione precedente** e mostra le ultime righe di log.
 
-Se un errore avviene dopo lo stop ma prima dello scambio (backup, spazio, migrazioni), lo script riavvia la versione vecchia senza aver modificato nulla. La cartella `OpenWA_new` rimane per capire cosa è andato storto e viene cancellata al lancio successivo.
+Se un errore avviene dopo lo stop ma prima dello scambio (migrazioni), lo script riavvia la versione vecchia senza aver modificato nulla. La cartella `OpenWA_new` rimane per capire cosa è andato storto e viene cancellata al lancio successivo.
 
 ### Parametri modificabili
 
@@ -141,15 +140,13 @@ In testa allo script:
 |---|---|---|
 | `APP_USER` | `nodeapp` | Utente che esegue l'app |
 | `APP_DIR` | `/home/nodeapp/OpenWA` | Cartella della versione attiva |
-| `BACKUP_DIR` | `/home/nodeapp/openwa-backups` | Dove vanno gli archivi |
-| `KEEP_BACKUPS` | `10` | Quanti archivi conservare |
-| `WORK_TMP` | `/home/nodeapp/.openwa-tmp` | Cartella temporanea su disco usata da npm e backup al posto di `/tmp` (cancellata a fine script) |
+| `WORK_TMP` | `/home/nodeapp/.openwa-tmp` | Cartella temporanea su disco usata da npm al posto di `/tmp` (cancellata a fine script) |
 | `PM2_APP_NAME` | `openwa` | Nome dell'app in PM2 |
 | `RUN_MIGRATIONS` | `1` | `0` per saltare le migrazioni |
 | `HEALTH_TIMEOUT` | `120` | Secondi di attesa per `/api/health` |
 | `KEEP_FILES` | `.env`, `ecosystem.config.js` | File di configurazione da portare |
-| `KEEP_STATE` | `data/main.sqlite` (+ `-wal`/`-shm`), `data/.api-key` | Unico stato portato nella nuova versione: le API key |
-| `DROP_DATA` | `data/sessions` | Cartelle escluse dal backup e cancellate da `OpenWA_old` ad aggiornamento riuscito |
+| `BOOTSTRAP_KEY_FILE` | `data/.api-key` | Da dove viene letta la API key admin da conservare in `.env` (`API_MASTER_KEY`) |
+| `DROP_DATA` | `data/sessions` | Cartelle cancellate da `OpenWA_old` ad aggiornamento riuscito |
 
 ---
 
@@ -232,31 +229,17 @@ Da sapere:
 - Tornare a una versione precedente alla 0.23.6 fa perdere le restrizioni per chat delle API key.
 - Le cartelle `OpenWA_failed_*` non vengono cancellate da sole: eliminarle quando non servono più.
 
-### Ripristino da un archivio di backup
-
-Se `OpenWA_old` non basta (per esempio serve un backup più vecchio), si usa lo script ufficiale del progetto con l'app ferma:
-
-```bash
-su - nodeapp -c 'pm2 stop openwa'
-su - nodeapp -c 'cd /home/nodeapp/OpenWA && ./scripts/restore.sh /home/nodeapp/openwa-backups/openwa-backup-<data>.tar.gz --force'
-su - nodeapp -c 'pm2 start openwa'
-```
-
-`restore.sh` fa prima una copia di sicurezza dei dati attuali (`data.pre-restore-<data>`). `--force` serve perché i database esistenti contengono già dati.
-
----
-
 ## 7. Backup
 
-- Ogni aggiornamento crea un archivio `openwa-backup-<data>.tar.gz` in `/home/nodeapp/openwa-backups/` (permessi `700`).
-- Gli archivi contengono database, sessioni, API key e segreti: vanno trattati come dati riservati e copiati anche fuori dal server.
-- Per un backup fuori dagli aggiornamenti:
+`update-openwa.sh` **non fa backup**: né dei database SQLite né del resto. L'unica copia di sicurezza è `OpenWA_old`, che conserva la versione precedente con i suoi dati (sessioni escluse), sostituita a ogni aggiornamento.
 
-  ```bash
-  su - nodeapp -c 'cd /home/nodeapp/OpenWA && BACKUP_DIR=/home/nodeapp/openwa-backups ./scripts/backup.sh'
-  ```
+Se in futuro servisse un archivio, il progetto ha uno script ufficiale, da lanciare a mano:
 
-  Con l'app attiva il backup dei database è comunque consistente (grazie a `sqlite3`), mentre le sessioni WhatsApp potrebbero essere copiate a metà scrittura: nel peggiore dei casi, dopo un ripristino, una sessione va riabbinata.
+```bash
+su - nodeapp -c 'cd /home/nodeapp/OpenWA && TMPDIR=/home/nodeapp BACKUP_DIR=/home/nodeapp/openwa-backups ./scripts/backup.sh'
+```
+
+`TMPDIR` va puntata sul disco, perché lo script copia i dati in una cartella temporanea prima di comprimerli e `/tmp` da 4 GB non basta.
 
 ---
 
@@ -278,7 +261,7 @@ Se le sessioni tornano al QR invece di riconnettersi, controllare i log e, se se
 Dal changelog del progetto (sezione "Known Upgrade Hazards" in `docs/14-migration-guide.md`):
 
 - una API key rifiutata per IP (`allowedIps`) o per sessione (`allowedSessions`) risponde `403` invece di `401`;
-- `main.sqlite` esegue le proprie migrazioni a ogni avvio; se trova una migrazione sconosciuta si ferma con `MainSchemaMismatchError` (per questo il backup prima dell'aggiornamento è importante);
+- `main.sqlite` esegue le proprie migrazioni a ogni avvio (con l'installazione pulita parte comunque da un file nuovo);
 - `POST /mcp` richiede sempre una API key valida;
 - il controllo dei numeri (`contacts/check`) richiede una chiave OPERATOR;
 - modificare il proxy di una sessione richiede una chiave ADMIN;
@@ -294,12 +277,12 @@ Prima di ogni aggiornamento conviene leggere la stessa sezione per la versione d
 |---|---|---|
 | Lo script si ferma al clone | Il tag passato con `--ref` non esiste | Lanciare senza `--ref`, o verificare i tag su GitHub |
 | Errore in `npm ci` o nella build | Versione di Node non adatta, rete, dipendenze | La produzione è ancora attiva; controllare l'output e Node (sezione 5) |
-| "Spazio su disco insufficiente" all'avvio | Servono circa 2 volte `data/` (sessioni escluse) più 1,5 GB | Liberare spazio o cancellare vecchi backup / `OpenWA_failed_*` |
+| "Spazio su disco insufficiente" all'avvio | Servono circa 1,5 GB per la nuova versione | Liberare spazio o cancellare le cartelle `OpenWA_failed_*` |
 | Errori "No space left" o "Permission denied" su file temporanei | `/tmp` in RAM (Debian 13) o montato `noexec` | Già risolto: lo script usa `WORK_TMP` su disco |
 | Errore nelle migrazioni | Schema del database non compatibile | L'app vecchia viene riavviata; leggere l'errore e la guida di migrazione |
 | Rollback automatico | La nuova versione non risponde a `/api/health` | Vedere i log stampati e quelli in `OpenWA_failed_<data>` |
 | Riavvii continui in PM2 | `max_memory_restart` troppo basso | Alzare il limite in `ecosystem.config.js` |
-| Sessioni tornano al QR | `data/sessions` mancante o rovinato | Rollback, o ripristino da backup |
+| Sessioni tornano al QR | Normale dopo ogni aggiornamento: si riparte puliti | Riabbinare dalla dashboard |
 
 ---
 
@@ -363,4 +346,4 @@ Poi rilanciare lo script. Lo stesso vale se la porta di OpenWA cambia.
 - Repository: <https://github.com/rmyndharis/OpenWA>
 - Runbook operativi: `docs/11-operational-runbooks.md`
 - Guida di migrazione e rischi noti: `docs/14-migration-guide.md`
-- Script ufficiali di backup e ripristino: `scripts/backup.sh`, `scripts/restore.sh`
+- Script ufficiale di backup (non usato dall'aggiornamento): `scripts/backup.sh`

@@ -14,15 +14,16 @@ set -Eeuo pipefail
 #
 # Segue il runbook ufficiale "Version Upgrade" (docs/11-operational-runbooks.md):
 #   1. clona la nuova versione in OpenWA_new e la compila (l'app attuale gira ancora)
-#   2. ferma l'app e fa un backup completo con scripts/backup.sh del progetto
-#      (main.sqlite, openwa.sqlite, sessioni, media, plugin, .env.generated, .api-key)
-#   3. COPIA data/ nella nuova versione (OpenWA_old resta intatto per il rollback)
+#   2. ferma l'app (nessun backup: la copia di sicurezza e' OpenWA_old)
+#   3. la nuova versione riparte PULITA: data/ viene ricreata vuota (nessun
+#      database copiato). La API key admin resta la stessa perche' viene scritta
+#      in .env come API_MASTER_KEY: al primo avvio OpenWA la ricrea identica.
 #   4. esegue le migrazioni del database (npm run migration:run:prod)
 #   5. OpenWA -> OpenWA_old, OpenWA_new -> OpenWA, riavvio con PM2
 #   6. controlla /api/health; se non risponde torna da solo alla versione precedente
 #
-# Lo storico (chat, sessioni WhatsApp, API key, audit log, media) sta tutto in data/:
-# viene copiato, mai spostato, e ogni aggiornamento lascia un archivio in BACKUP_DIR.
+# OpenWA_old contiene i dati precedenti, quindi un rollback riporta tutto com'era
+# (sessioni escluse).
 # ============================================================
 
 # ---- Configurazione ----
@@ -30,11 +31,9 @@ APP_USER="nodeapp"
 APP_DIR="/home/${APP_USER}/OpenWA"
 NEW_DIR="${APP_DIR}_new"
 OLD_DIR="${APP_DIR}_old"
-BACKUP_DIR="/home/${APP_USER}/openwa-backups"   # fuori dal repo, sopravvive agli aggiornamenti
-# Cartella temporanea su disco, usata al posto di /tmp da npm e da backup.sh.
-# /tmp su Debian 13 e' in RAM (meta' della memoria): il backup dei media la riempie.
+# Cartella temporanea su disco, usata al posto di /tmp da npm.
+# /tmp su Debian 13 e' in RAM (meta' della memoria).
 WORK_TMP="/home/${APP_USER}/.openwa-tmp"
-KEEP_BACKUPS=10                                  # archivi da conservare
 REPO_URL="https://github.com/rmyndharis/OpenWA.git"
 PM2_APP_NAME="openwa"
 RUN_MIGRATIONS=1
@@ -42,14 +41,12 @@ HEALTH_TIMEOUT=120                               # secondi di attesa per /api/he
 
 # File di configurazione da portare nella nuova versione (obbligatori)
 KEEP_FILES=(".env" "ecosystem.config.js")
-# Cartelle di stato da copiare (se esistono). "plugins" e' la vecchia posizione
-# dei plugin (fino alla 0.12.1), oggi stanno in data/plugins.
-KEEP_DATA=("data" "plugins")
-# Sottocartelle da NON portare nella nuova versione (percorsi relativi a OpenWA/).
-# data/sessions = login WhatsApp di whatsapp-web.js: senza, ogni sessione
-# va riabbinata con il QR dopo l'aggiornamento. Sono escluse anche dal backup
-# (possono pesare diversi GB) e, ad aggiornamento riuscito, cancellate da OpenWA_old.
-EXCLUDE_DATA=("data/sessions")
+# Nessun file di data/ viene portato nella nuova versione: si riparte puliti.
+# La API key admin viene conservata tramite API_MASTER_KEY in .env (vedi sotto).
+BOOTSTRAP_KEY_FILE="data/.api-key"
+# Cartelle grandi cancellate da OpenWA_old ad aggiornamento
+# riuscito (data/sessions = profili Chromium di whatsapp-web.js, diversi GB).
+DROP_DATA=("data/sessions")
 # -------------------------
 
 REF=""
@@ -143,12 +140,6 @@ for f in "${KEEP_FILES[@]}"; do
   [[ -f "${APP_DIR}/${f}" ]] || { echo "File ${APP_DIR}/${f} mancante, interrompo." >&2; exit 1; }
 done
 
-# sqlite3 permette a backup.sh di fare una copia consistente dei database
-if ! command -v sqlite3 &>/dev/null; then
-  log "Installo sqlite3 (serve per un backup consistente)..."
-  apt-get install -y sqlite3 >/dev/null
-fi
-
 # ---- Versione di destinazione ----
 CURRENT_VERSION="$(app_version "$APP_DIR")"
 if [[ -z "$REF" ]]; then
@@ -187,23 +178,12 @@ on_error() {
 trap on_error ERR
 
 # ---- Spazio su disco ----
-# Servono circa: staging del backup + archivio + copia di data/ + nuova versione (~1.5 GB)
-DATA_KB=0
-for d in "${KEEP_DATA[@]}"; do
-  if [[ -e "${APP_DIR}/${d}" ]]; then
-    DATA_KB=$((DATA_KB + $(du -sk "${APP_DIR}/${d}" | cut -f1)))
-  fi
-done
-for x in "${EXCLUDE_DATA[@]}"; do
-  if [[ -e "${APP_DIR}/${x}" ]]; then
-    DATA_KB=$((DATA_KB - $(du -sk "${APP_DIR}/${x}" | cut -f1)))
-  fi
-done
-NEED_KB=$((DATA_KB * 3 + 1536000))
+# Serve spazio per la nuova versione (codice, node_modules, build): ~1.5 GB
+NEED_KB=1536000
 FREE_KB="$(df -Pk "/home/${APP_USER}" | awk 'NR==2 {print $4}')"
-echo " Dati da copiare: $((DATA_KB / 1024)) MB, spazio necessario ~$((NEED_KB / 1024)) MB, libero $((FREE_KB / 1024)) MB"
+echo " Spazio necessario ~$((NEED_KB / 1024)) MB, libero $((FREE_KB / 1024)) MB"
 if (( FREE_KB < NEED_KB )); then
-  warn "Spazio su disco insufficiente: libera spazio (vecchi backup, cartelle OpenWA_failed_*) e riprova."
+  warn "Spazio su disco insufficiente: libera spazio (cartelle OpenWA_failed_*) e riprova."
   exit 1
 fi
 
@@ -219,54 +199,37 @@ for f in "${KEEP_FILES[@]}"; do
 done
 echo "ecosystem.config.js" >> "${NEW_DIR}/.git/info/exclude"
 
+# ---- API key: la stessa anche su un'installazione pulita ----
+# Al primo avvio, se non esistono API key, OpenWA crea la chiave admin usando
+# API_MASTER_KEY. Mettendo li' la chiave attuale, la nuova versione la ricrea identica.
+if grep -qE '^[[:space:]]*API_MASTER_KEY=[^[:space:]#]' "${NEW_DIR}/.env"; then
+  echo "    API key admin: gia' fissata in .env (API_MASTER_KEY)"
+elif [[ -s "${APP_DIR}/${BOOTSTRAP_KEY_FILE}" ]]; then
+  CURRENT_KEY="$(tr -d '[:space:]' < "${APP_DIR}/${BOOTSTRAP_KEY_FILE}")"
+  sed -i '/^[[:space:]]*API_MASTER_KEY=/d' "${NEW_DIR}/.env"
+  printf '\n# API key admin, conservata da update-openwa.sh\nAPI_MASTER_KEY=%s\n' "$CURRENT_KEY" >> "${NEW_DIR}/.env"
+  echo "    API key admin: copiata da ${BOOTSTRAP_KEY_FILE} in .env (API_MASTER_KEY)"
+else
+  warn "Nessuna API key trovata (${BOOTSTRAP_KEY_FILE} e API_MASTER_KEY assenti):"
+  warn "la nuova versione generera' una nuova chiave admin in data/.api-key."
+fi
+
 log "Installo le dipendenze e compilo (l'app attuale resta attiva)..."
 as_app "cd '${NEW_DIR}' && npm ci && npm run build && npm run dashboard:build"
 
-# ---- 2. Stop + backup ----
+# ---- 2. Stop ----
 log "Fermo l'app..."
 APP_STOPPED=1
 as_app "pm2 stop '${PM2_APP_NAME}'" || true
 
-log "Backup completo in ${BACKUP_DIR}..."
-mkdir -p "$BACKUP_DIR"
-chown "$APP_USER": "$BACKUP_DIR"
-chmod 700 "$BACKUP_DIR"
-if [[ -x "${APP_DIR}/scripts/backup.sh" ]]; then
-  # Le cartelle escluse non entrano nemmeno nel backup: backup.sh salta le sessioni
-  # se SESSION_DATA_PATH punta a una cartella inesistente.
-  SKIP_ENV=""
-  for x in "${EXCLUDE_DATA[@]}"; do
-    if [[ "$x" == "data/sessions" ]]; then
-      SKIP_ENV="SESSION_DATA_PATH='${WORK_TMP}/nessuna-sessione'"
-    fi
-  done
-  as_app "cd '${APP_DIR}' && ${SKIP_ENV} BACKUP_DIR='${BACKUP_DIR}' ./scripts/backup.sh"
-else
-  # versioni precedenti alla 0.19.0 non hanno backup.sh
-  ARCHIVE="${BACKUP_DIR}/openwa-backup-$(date +%Y%m%d-%H%M%S)-data.tar.gz"
-  EXCL_ARGS=()
-  for x in "${EXCLUDE_DATA[@]}"; do EXCL_ARGS+=("--exclude=./${x}"); done
-  as_app "cd '${APP_DIR}' && tar ${EXCL_ARGS[*]} -czf '${ARCHIVE}' ./data ./.env"
-  echo "    ${ARCHIVE}"
-fi
+# ---- 3. Dati: si riparte puliti ----
+log "Creo data/ vuota (nessun database copiato)..."
+rm -rf "${NEW_DIR:?}/data"
+mkdir -p "${NEW_DIR}/data"
+chown "$APP_USER": "${NEW_DIR}/data"
+chmod 700 "${NEW_DIR}/data"
 
-log "Tengo solo gli ultimi ${KEEP_BACKUPS} backup..."
-ls -1t "${BACKUP_DIR}"/openwa-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f -- || true
-
-# ---- 3. Dati ----
-log "Copio i dati (storico, database, media, plugin)..."
-for x in "${EXCLUDE_DATA[@]}"; do echo "    escluso: ${x}"; done
-for d in "${KEEP_DATA[@]}"; do
-  if [[ -e "${APP_DIR}/${d}" ]]; then
-    rm -rf "${NEW_DIR:?}/${d}"
-    EXCL_ARGS=()
-    for x in "${EXCLUDE_DATA[@]}"; do EXCL_ARGS+=("--exclude=./${x}"); done
-    (cd "$APP_DIR" && tar "${EXCL_ARGS[@]}" -cf - "./${d}") | (cd "$NEW_DIR" && tar -xpf -)
-    echo "    ${d}"
-  fi
-done
-
-# ---- 4. Migrazioni (sulla copia: OpenWA resta intatto) ----
+# ---- 4. Migrazioni (nella nuova versione: OpenWA resta intatto) ----
 if [[ $RUN_MIGRATIONS -eq 1 ]]; then
   log "Eseguo le migrazioni del database..."
   as_app "cd '${NEW_DIR}' && NODE_ENV=production npm run migration:run:prod"
@@ -290,8 +253,8 @@ if ! pm2_restart_from "$APP_DIR" || ! wait_healthy "$APP_DIR"; then
   exit 1
 fi
 
-# Le cartelle escluse non servono piu' nemmeno in OpenWA_old: libero spazio
-for x in "${EXCLUDE_DATA[@]}"; do
+# Le sessioni non servono piu' nemmeno in OpenWA_old: libero spazio
+for x in "${DROP_DATA[@]}"; do
   if [[ -e "${OLD_DIR}/${x}" ]]; then
     log "Libero spazio: elimino ${OLD_DIR}/${x}"
     rm -rf "${OLD_DIR:?}/${x}"
@@ -303,9 +266,9 @@ echo "======================================================"
 echo " Aggiornamento completato: ${CURRENT_VERSION} -> $(app_version "$APP_DIR")"
 echo " Versione attiva:     ${APP_DIR}"
 echo " Versione precedente: ${OLD_DIR}"
-echo " Backup:              ${BACKUP_DIR}"
 echo ""
-echo " Le sessioni WhatsApp vanno riabbinate: apri la dashboard e scansiona il QR."
+echo " Installazione pulita: la API key admin e' la stessa; sessioni, webhook,"
+echo " altre API key e impostazioni della dashboard vanno ricreati (QR da scansionare)."
 echo "   su - ${APP_USER} -c 'pm2 logs ${PM2_APP_NAME}'"
 echo "   curl -H \"X-API-Key: \$API_KEY\" http://127.0.0.1:$(app_port "$APP_DIR")/api/sessions"
 echo ""

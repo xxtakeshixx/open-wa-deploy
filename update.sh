@@ -31,9 +31,12 @@ APP_USER="nodeapp"
 APP_DIR="/home/${APP_USER}/OpenWA"
 NEW_DIR="${APP_DIR}_new"
 OLD_DIR="${APP_DIR}_old"
-# Cartella temporanea su disco, usata al posto di /tmp da npm.
-# /tmp su Debian 13 e' in RAM (meta' della memoria).
-WORK_TMP="/home/${APP_USER}/.openwa-tmp"
+# Cartella temporanea su disco, usata SOLO da npm durante l'aggiornamento
+# (/tmp su Debian 13 e' in RAM). Viene cancellata a fine script, quindi l'app
+# non deve mai ereditarla: i comandi PM2 usano TMPDIR=/tmp (vedi as_app_pm2).
+# Nome diverso dal vecchio ".openwa-tmp", che le versioni precedenti dello script
+# lasciavano come TMPDIR dell'app: cosi' questo script non lo cancella mai.
+WORK_TMP="/home/${APP_USER}/.openwa-update-tmp"
 REPO_URL="https://github.com/rmyndharis/OpenWA.git"
 PM2_APP_NAME="openwa"
 RUN_MIGRATIONS=1
@@ -84,8 +87,29 @@ app_port() {
   echo "${p:-2785}"
 }
 
+# Chromium (whatsapp-web.js) puo' sopravvivere allo stop di PM2 o lasciare i file
+# di blocco "Singleton*" nel profilo: al riavvio darebbe "The browser is already
+# running for .../data/sessions/...". Il server e' dedicato, quindi si chiudono
+# tutti i Chromium dell'utente e si tolgono i blocchi prima di ogni avvio.
+cleanup_browsers() {
+  pkill -u "$APP_USER" -f 'chrom(e|ium)' 2>/dev/null || true
+  sleep 2
+  pkill -9 -u "$APP_USER" -f 'chrom(e|ium)' 2>/dev/null || true
+  if [[ -d "$1/data/sessions" ]]; then
+    find "$1/data/sessions" -maxdepth 2 -name 'Singleton*' -delete 2>/dev/null || true
+  fi
+}
+
+# Comandi PM2 SENZA la cartella temporanea dello script: l'app eredita l'ambiente
+# di "pm2 start", e WORK_TMP viene cancellata a fine script. Con TMPDIR inesistente
+# Chrome non riesce a creare il suo lock e Puppeteer risponde, in modo fuorviante,
+# "The browser is already running for .../data/sessions/...".
+as_app_pm2() { su - "$APP_USER" -c "export TMPDIR=/tmp TMP=/tmp TEMP=/tmp; $1"; }
+
 pm2_restart_from() {
-  as_app "cd '$1' && (pm2 delete '${PM2_APP_NAME}' >/dev/null 2>&1 || true) && pm2 start ecosystem.config.js && pm2 save"
+  as_app_pm2 "pm2 delete '${PM2_APP_NAME}' >/dev/null 2>&1 || true"
+  cleanup_browsers "$1"
+  as_app_pm2 "cd '$1' && pm2 start ecosystem.config.js && pm2 save"
 }
 
 wait_healthy() {
@@ -109,7 +133,7 @@ do_rollback() {
   fi
   local failed="${APP_DIR}_failed_$(date +%Y%m%d-%H%M%S)"
   log "Rollback: $(app_version "$APP_DIR") -> $(app_version "$OLD_DIR")"
-  as_app "pm2 stop '${PM2_APP_NAME}'" || true
+  as_app_pm2 "pm2 stop '${PM2_APP_NAME}'" || true
   mv "$APP_DIR" "$failed"
   mv "$OLD_DIR" "$APP_DIR"
   pm2_restart_from "$APP_DIR"
@@ -220,7 +244,7 @@ as_app "cd '${NEW_DIR}' && npm ci && npm run build && npm run dashboard:build"
 # ---- 2. Stop ----
 log "Fermo l'app..."
 APP_STOPPED=1
-as_app "pm2 stop '${PM2_APP_NAME}'" || true
+as_app_pm2 "pm2 stop '${PM2_APP_NAME}'" || true
 
 # ---- 3. Dati: si riparte puliti ----
 log "Creo data/ vuota (nessun database copiato)..."
@@ -246,11 +270,25 @@ trap - ERR
 log "Avvio la nuova versione con PM2..."
 if ! pm2_restart_from "$APP_DIR" || ! wait_healthy "$APP_DIR"; then
   warn "La nuova versione non risponde. Ultime righe di log:"
-  as_app "pm2 logs '${PM2_APP_NAME}' --lines 40 --nostream" || true
+  as_app_pm2 "pm2 logs '${PM2_APP_NAME}' --lines 40 --nostream" || true
   warn "Torno automaticamente alla versione precedente."
   do_rollback
   wait_healthy "$APP_DIR" || warn "Anche la versione precedente non risponde: controlla pm2 logs."
   exit 1
+fi
+
+# Controllo: l'app deve avere una cartella temporanea che esiste davvero,
+# altrimenti Chrome non parte ("The browser is already running for ...").
+APP_PID="$(pgrep -u "$APP_USER" -f 'dist/main' | head -n 1 || true)"
+if [[ -n "$APP_PID" ]]; then
+  APP_TMP="$(tr '\0' '\n' < "/proc/${APP_PID}/environ" | sed -n 's/^TMPDIR=//p' | head -n 1)"
+  APP_TMP="${APP_TMP:-/tmp}"
+  if [[ -d "$APP_TMP" ]]; then
+    echo "    Cartella temporanea dell'app: ${APP_TMP} (ok)"
+  else
+    warn "L'app usa TMPDIR=${APP_TMP}, che non esiste: le sessioni non partiranno."
+    warn "Controlla il file /home/${APP_USER}/.pm2/dump.pm2 e l'ambiente di PM2."
+  fi
 fi
 
 # Le sessioni non servono piu' nemmeno in OpenWA_old: libero spazio

@@ -121,7 +121,7 @@ Senza argomenti lo script cerca **l'ultima release pubblicata** su GitHub (tag `
 
 Lo script segue il runbook ufficiale del progetto (`docs/11-operational-runbooks.md`, "Version Upgrade"):
 
-0. **Controlla lo spazio su disco** prima di iniziare (circa 1,5 GB). Tutti i file temporanei vanno in `/home/nodeapp/.openwa-tmp` invece che in `/tmp`.
+0. **Controlla lo spazio su disco** prima di iniziare (circa 1,5 GB). I file temporanei di npm vanno in `/home/nodeapp/.openwa-update-tmp` invece che in `/tmp`.
 1. **Prepara la nuova versione mentre l'app vecchia gira ancora.** Clona la release in `OpenWA_new`, copia `.env` ed `ecosystem.config.js`, esegue `npm ci`, `npm run build` e `npm run dashboard:build`. Se qualcosa fallisce qui, la produzione non viene toccata.
 2. **Ferma l'app.** Non viene fatto nessun backup: la copia di sicurezza è `OpenWA_old`, che resta con i dati com'erano prima dell'aggiornamento.
 3. **Riparte pulito.** La nuova `data/` è vuota: nessun database viene copiato, quindi niente sessioni vecchie rimaste nel database senza i loro file. Vengono ricreati da zero **sessioni** (QR), **webhook**, messaggi, media, plugin, impostazioni della dashboard e **le API key create a mano**. La **API key admin** invece resta identica: lo script legge quella attuale da `data/.api-key` e la scrive in `.env` come `API_MASTER_KEY` (se non c'è già). Al primo avvio, trovando il database vuoto, OpenWA crea la chiave admin con quel valore. `OpenWA` viene rinominato in `OpenWA_old` senza toccarne i dati, quindi un rollback riporta tutto com'era, sessioni escluse.
@@ -140,7 +140,7 @@ In testa allo script:
 |---|---|---|
 | `APP_USER` | `nodeapp` | Utente che esegue l'app |
 | `APP_DIR` | `/home/nodeapp/OpenWA` | Cartella della versione attiva |
-| `WORK_TMP` | `/home/nodeapp/.openwa-tmp` | Cartella temporanea su disco usata da npm al posto di `/tmp` (cancellata a fine script) |
+| `WORK_TMP` | `/home/nodeapp/.openwa-update-tmp` | Cartella temporanea su disco usata solo da npm durante l'aggiornamento (cancellata a fine script). L'app parte sempre con `TMPDIR=/tmp` |
 | `PM2_APP_NAME` | `openwa` | Nome dell'app in PM2 |
 | `RUN_MIGRATIONS` | `1` | `0` per saltare le migrazioni |
 | `HEALTH_TIMEOUT` | `120` | Secondi di attesa per `/api/health` |
@@ -283,6 +283,7 @@ Prima di ogni aggiornamento conviene leggere la stessa sezione per la versione d
 | Rollback automatico | La nuova versione non risponde a `/api/health` | Vedere i log stampati e quelli in `OpenWA_failed_<data>` |
 | Riavvii continui in PM2 | `max_memory_restart` troppo basso | Alzare il limite in `ecosystem.config.js` |
 | Sessioni tornano al QR | Normale dopo ogni aggiornamento: si riparte puliti | Riabbinare dalla dashboard |
+| "The browser is already running for .../data/sessions/..." all'avvio di una sessione | L'app ha `TMPDIR` che punta a una cartella inesistente: le versioni precedenti dello script avviavano PM2 con `TMPDIR=/home/nodeapp/.openwa-tmp` e poi la cancellavano, e PM2 lo ricorda in `~/.pm2/dump.pm2`. Chrome non riesce a creare il suo lock e Puppeteer mostra questo messaggio fuorviante | Toppa immediata: ricreare `/home/nodeapp/.openwa-tmp` (proprietario `nodeapp`, permessi `700`). Soluzione: il prossimo aggiornamento riavvia l'app con `TMPDIR=/tmp` e a fine esecuzione controlla che la cartella temporanea dell'app esista; dopo, `.openwa-tmp` si può cancellare |
 
 ---
 

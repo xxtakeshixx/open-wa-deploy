@@ -52,6 +52,8 @@ Tutti i dati che non si possono ricreare stanno in `OpenWA/data/`:
 
 Oltre a `data/` servono `.env` ed `ecosystem.config.js`. Tutto il resto (codice, `node_modules`, `dist`) si ricrea da GitHub.
 
+> **Con `update-openwa.sh` a ogni aggiornamento si riparte puliti:** della cartella `data/` vengono conservati solo `main.sqlite` e `.api-key` (le API key). Vedi sezione 3.
+
 > Ordine di priorità della configurazione: variabili d'ambiente > `.env` > `data/.env.generated`.
 > Un valore scritto in `.env` vince sempre su quello impostato dalla dashboard.
 
@@ -120,10 +122,10 @@ Senza argomenti lo script cerca **l'ultima release pubblicata** su GitHub (tag `
 
 Lo script segue il runbook ufficiale del progetto (`docs/11-operational-runbooks.md`, "Version Upgrade"):
 
-0. **Controlla lo spazio su disco** prima di iniziare (circa 3 volte `data/` più 1,5 GB). Tutti i file temporanei vanno in `/home/nodeapp/.openwa-tmp` invece che in `/tmp`.
+0. **Controlla lo spazio su disco** prima di iniziare (circa 2 volte `data/` senza sessioni, più 1,5 GB). Tutti i file temporanei vanno in `/home/nodeapp/.openwa-tmp` invece che in `/tmp`.
 1. **Prepara la nuova versione mentre l'app vecchia gira ancora.** Clona la release in `OpenWA_new`, copia `.env` ed `ecosystem.config.js`, esegue `npm ci`, `npm run build` e `npm run dashboard:build`. Se qualcosa fallisce qui, la produzione non viene toccata.
 2. **Ferma l'app e fa il backup.** Usa lo script ufficiale `scripts/backup.sh` del progetto (installa `sqlite3` se manca, per una copia consistente dei database). L'archivio finisce in `/home/nodeapp/openwa-backups/`; vengono conservati gli ultimi 10.
-3. **Copia** `data/` **tranne `data/sessions`** (login WhatsApp di whatsapp-web.js): dopo ogni aggiornamento le sessioni vanno riabbinate scansionando il QR dalla dashboard. Sono escluse anche dal backup, perché con i profili Chromium possono pesare diversi GB, e ad aggiornamento riuscito vengono cancellate anche da `OpenWA_old`: dopo un rollback le sessioni vanno riabbinate. Per portarle invece nella nuova versione, svuotare `EXCLUDE_DATA` in testa allo script. La copia (e non lo spostamento) lascia `OpenWA` intatto per il rollback.
+3. **Riparte pulito, tranne le API key.** Nella nuova versione vengono portati solo `data/main.sqlite` (API key e audit log) e `data/.api-key`, oltre a `.env` ed `ecosystem.config.js`. Tutto il resto viene ricreato vuoto: **sessioni** (da riabbinare con il QR), **webhook**, messaggi salvati, media, plugin e impostazioni salvate dalla dashboard (`data/.env.generated`). Le API key continuano a funzionare, ma quelle limitate a sessioni specifiche (`allowedSessions`) vanno aggiornate con gli id delle sessioni nuove. `OpenWA` viene rinominato in `OpenWA_old` senza toccarne i dati, quindi un rollback riporta tutto com'era, sessioni escluse.
 4. **Esegue le migrazioni del database** (`npm run migration:run:prod`) sulla copia.
 5. **Scambia le cartelle:** cancella il vecchio `OpenWA_old`, rinomina `OpenWA` in `OpenWA_old` e `OpenWA_new` in `OpenWA`.
 6. **Riavvia con PM2** e verifica `http://127.0.0.1:2785/api/health` per massimo 2 minuti.
@@ -146,8 +148,8 @@ In testa allo script:
 | `RUN_MIGRATIONS` | `1` | `0` per saltare le migrazioni |
 | `HEALTH_TIMEOUT` | `120` | Secondi di attesa per `/api/health` |
 | `KEEP_FILES` | `.env`, `ecosystem.config.js` | File di configurazione da portare |
-| `KEEP_DATA` | `data`, `plugins` | Cartelle di stato da copiare (`plugins` è la vecchia posizione, fino alla 0.12.1) |
-| `EXCLUDE_DATA` | `data/sessions` | Sottocartelle da non copiare nella nuova versione |
+| `KEEP_STATE` | `data/main.sqlite` (+ `-wal`/`-shm`), `data/.api-key` | Unico stato portato nella nuova versione: le API key |
+| `DROP_DATA` | `data/sessions` | Cartelle escluse dal backup e cancellate da `OpenWA_old` ad aggiornamento riuscito |
 
 ---
 
@@ -292,7 +294,7 @@ Prima di ogni aggiornamento conviene leggere la stessa sezione per la versione d
 |---|---|---|
 | Lo script si ferma al clone | Il tag passato con `--ref` non esiste | Lanciare senza `--ref`, o verificare i tag su GitHub |
 | Errore in `npm ci` o nella build | Versione di Node non adatta, rete, dipendenze | La produzione è ancora attiva; controllare l'output e Node (sezione 5) |
-| "Spazio su disco insufficiente" all'avvio | Servono circa 3 volte la dimensione di `data/` più 1,5 GB | Liberare spazio o cancellare vecchi backup / `OpenWA_failed_*` |
+| "Spazio su disco insufficiente" all'avvio | Servono circa 2 volte `data/` (sessioni escluse) più 1,5 GB | Liberare spazio o cancellare vecchi backup / `OpenWA_failed_*` |
 | Errori "No space left" o "Permission denied" su file temporanei | `/tmp` in RAM (Debian 13) o montato `noexec` | Già risolto: lo script usa `WORK_TMP` su disco |
 | Errore nelle migrazioni | Schema del database non compatibile | L'app vecchia viene riavviata; leggere l'errore e la guida di migrazione |
 | Rollback automatico | La nuova versione non risponde a `/api/health` | Vedere i log stampati e quelli in `OpenWA_failed_<data>` |

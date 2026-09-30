@@ -6,6 +6,7 @@ Documentazione dell'installazione di [OpenWA](https://github.com/rmyndharis/Open
 |---|---|
 | `deploy-openwa.sh` | Prima installazione del server |
 | `update-openwa.sh` | Aggiornamenti successivi e rollback |
+| `firewall-openwa.sh` | Firewall locale (nftables) |
 
 Entrambi vanno eseguiti come **root**.
 
@@ -119,9 +120,10 @@ Senza argomenti lo script cerca **l'ultima release pubblicata** su GitHub (tag `
 
 Lo script segue il runbook ufficiale del progetto (`docs/11-operational-runbooks.md`, "Version Upgrade"):
 
+0. **Controlla lo spazio su disco** prima di iniziare (circa 3 volte `data/` più 1,5 GB). Tutti i file temporanei vanno in `/home/nodeapp/.openwa-tmp` invece che in `/tmp`.
 1. **Prepara la nuova versione mentre l'app vecchia gira ancora.** Clona la release in `OpenWA_new`, copia `.env` ed `ecosystem.config.js`, esegue `npm ci`, `npm run build` e `npm run dashboard:build`. Se qualcosa fallisce qui, la produzione non viene toccata.
 2. **Ferma l'app e fa il backup.** Usa lo script ufficiale `scripts/backup.sh` del progetto (installa `sqlite3` se manca, per una copia consistente dei database). L'archivio finisce in `/home/nodeapp/openwa-backups/`; vengono conservati gli ultimi 10.
-3. **Controlla lo spazio su disco** e **copia** `data/` nella nuova versione. La copia (e non lo spostamento) lascia `OpenWA` intatto per il rollback.
+3. **Copia** `data/` **tranne `data/sessions`** (login WhatsApp di whatsapp-web.js): dopo ogni aggiornamento le sessioni vanno riabbinate scansionando il QR dalla dashboard. Sono escluse anche dal backup, perché con i profili Chromium possono pesare diversi GB, e ad aggiornamento riuscito vengono cancellate anche da `OpenWA_old`: dopo un rollback le sessioni vanno riabbinate. Per portarle invece nella nuova versione, svuotare `EXCLUDE_DATA` in testa allo script. La copia (e non lo spostamento) lascia `OpenWA` intatto per il rollback.
 4. **Esegue le migrazioni del database** (`npm run migration:run:prod`) sulla copia.
 5. **Scambia le cartelle:** cancella il vecchio `OpenWA_old`, rinomina `OpenWA` in `OpenWA_old` e `OpenWA_new` in `OpenWA`.
 6. **Riavvia con PM2** e verifica `http://127.0.0.1:2785/api/health` per massimo 2 minuti.
@@ -139,11 +141,13 @@ In testa allo script:
 | `APP_DIR` | `/home/nodeapp/OpenWA` | Cartella della versione attiva |
 | `BACKUP_DIR` | `/home/nodeapp/openwa-backups` | Dove vanno gli archivi |
 | `KEEP_BACKUPS` | `10` | Quanti archivi conservare |
+| `WORK_TMP` | `/home/nodeapp/.openwa-tmp` | Cartella temporanea su disco usata da npm e backup al posto di `/tmp` (cancellata a fine script) |
 | `PM2_APP_NAME` | `openwa` | Nome dell'app in PM2 |
 | `RUN_MIGRATIONS` | `1` | `0` per saltare le migrazioni |
 | `HEALTH_TIMEOUT` | `120` | Secondi di attesa per `/api/health` |
 | `KEEP_FILES` | `.env`, `ecosystem.config.js` | File di configurazione da portare |
 | `KEEP_DATA` | `data`, `plugins` | Cartelle di stato da copiare (`plugins` è la vecchia posizione, fino alla 0.12.1) |
+| `EXCLUDE_DATA` | `data/sessions` | Sottocartelle da non copiare nella nuova versione |
 
 ---
 
@@ -288,11 +292,67 @@ Prima di ogni aggiornamento conviene leggere la stessa sezione per la versione d
 |---|---|---|
 | Lo script si ferma al clone | Il tag passato con `--ref` non esiste | Lanciare senza `--ref`, o verificare i tag su GitHub |
 | Errore in `npm ci` o nella build | Versione di Node non adatta, rete, dipendenze | La produzione è ancora attiva; controllare l'output e Node (sezione 5) |
-| "Spazio insufficiente" | `data/` è grande (media) | Liberare spazio o cancellare vecchi backup / `OpenWA_failed_*` |
+| "Spazio su disco insufficiente" all'avvio | Servono circa 3 volte la dimensione di `data/` più 1,5 GB | Liberare spazio o cancellare vecchi backup / `OpenWA_failed_*` |
+| Errori "No space left" o "Permission denied" su file temporanei | `/tmp` in RAM (Debian 13) o montato `noexec` | Già risolto: lo script usa `WORK_TMP` su disco |
 | Errore nelle migrazioni | Schema del database non compatibile | L'app vecchia viene riavviata; leggere l'errore e la guida di migrazione |
 | Rollback automatico | La nuova versione non risponde a `/api/health` | Vedere i log stampati e quelli in `OpenWA_failed_<data>` |
 | Riavvii continui in PM2 | `max_memory_restart` troppo basso | Alzare il limite in `ecosystem.config.js` |
 | Sessioni tornano al QR | `data/sessions` mancante o rovinato | Rollback, o ripristino da backup |
+
+---
+
+## 11. Firewall (`firewall-openwa.sh`)
+
+Il server è raggiungibile solo dalla rete locale e sta dietro un firewall perimetrale che non lo espone su internet. Il firewall sul server (nftables, quello standard di Debian) è una seconda barriera, per esempio contro altri dispositivi compromessi nella LAN.
+
+### Regole
+
+| Direzione | Cosa passa |
+|---|---|
+| Ingresso | SSH e OpenWA (porta `2785`, API e dashboard) **solo dalle reti locali**; ping dalla LAN; ICMPv6 indispensabile; risposte a connessioni già aperte |
+| Ingresso, tutto il resto | Scartato |
+| Inoltro (forward) | Bloccato (il server non fa da router) |
+| Uscita | Libera: serve per WhatsApp, GitHub, npm, apt e l'invio dei webhook |
+
+### Uso
+
+```bash
+chmod +x firewall-openwa.sh
+./firewall-openwa.sh            # configura e attiva
+./firewall-openwa.sh --status   # mostra le regole attive e i pacchetti scartati
+./firewall-openwa.sh --off      # disattiva il firewall (tutto aperto)
+```
+
+Lo script rileva da solo:
+
+- la **sottorete locale**, dall'interfaccia di rete principale;
+- la **porta SSH**, dalla configurazione di `sshd`;
+- la **porta di OpenWA**, da `.env`.
+
+Mostra i valori trovati e chiede conferma. Se l'IP da cui sei collegato in SSH non rientra nelle reti ammesse, si ferma prima di applicare qualsiasi regola.
+
+### Protezione contro il blocco dell'accesso
+
+1. Salva le regole attuali in `/root/nftables.backup-<data>.nft`.
+2. Applica le nuove regole (la sessione SSH in corso resta aperta).
+3. Chiede di provare **una nuova sessione SSH** e l'accesso alla dashboard da un PC della rete locale, poi di confermare entro 60 secondi.
+4. Senza conferma ripristina le regole precedenti. Solo con la conferma le salva in `/etc/nftables.conf` e attiva il servizio `nftables`, così restano dopo il riavvio.
+
+### Reti aggiuntive
+
+Di default è ammessa solo la sottorete del server. Se client, gestionali o altri server che chiamano l'API stanno in **altre sottoreti o VLAN**, vanno aggiunte in testa allo script:
+
+```bash
+LAN_NETS="192.168.1.0/24 10.10.0.0/16"
+```
+
+Poi rilanciare lo script. Lo stesso vale se la porta di OpenWA cambia.
+
+### Note
+
+- Lo script si rifiuta di partire se sono attivi `ufw` o `firewalld`, per non avere due firewall in conflitto.
+- Gli aggiornamenti di OpenWA non richiedono modifiche al firewall, perché il traffico in uscita è libero.
+- Se OpenWA non risponde dalla LAN, verificare con `./firewall-openwa.sh --status` che la rete del client sia nel set `lan4` e guardare il contatore della regola `drop`.
 
 ---
 

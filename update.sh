@@ -31,6 +31,9 @@ APP_DIR="/home/${APP_USER}/OpenWA"
 NEW_DIR="${APP_DIR}_new"
 OLD_DIR="${APP_DIR}_old"
 BACKUP_DIR="/home/${APP_USER}/openwa-backups"   # fuori dal repo, sopravvive agli aggiornamenti
+# Cartella temporanea su disco, usata al posto di /tmp da npm e da backup.sh.
+# /tmp su Debian 13 e' in RAM (meta' della memoria): il backup dei media la riempie.
+WORK_TMP="/home/${APP_USER}/.openwa-tmp"
 KEEP_BACKUPS=10                                  # archivi da conservare
 REPO_URL="https://github.com/rmyndharis/OpenWA.git"
 PM2_APP_NAME="openwa"
@@ -42,6 +45,11 @@ KEEP_FILES=(".env" "ecosystem.config.js")
 # Cartelle di stato da copiare (se esistono). "plugins" e' la vecchia posizione
 # dei plugin (fino alla 0.12.1), oggi stanno in data/plugins.
 KEEP_DATA=("data" "plugins")
+# Sottocartelle da NON portare nella nuova versione (percorsi relativi a OpenWA/).
+# data/sessions = login WhatsApp di whatsapp-web.js: senza, ogni sessione
+# va riabbinata con il QR dopo l'aggiornamento. Sono escluse anche dal backup
+# (possono pesare diversi GB) e, ad aggiornamento riuscito, cancellate da OpenWA_old.
+EXCLUDE_DATA=("data/sessions")
 # -------------------------
 
 REF=""
@@ -59,7 +67,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-as_app() { su - "$APP_USER" -c "$1"; }
+as_app() { su - "$APP_USER" -c "export TMPDIR='${WORK_TMP}' TMP='${WORK_TMP}' TEMP='${WORK_TMP}'; $1"; }
 log() { echo "==> $*"; }
 warn() { echo "!!  $*" >&2; }
 
@@ -118,6 +126,11 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+mkdir -p "$WORK_TMP"
+chown "$APP_USER": "$WORK_TMP"
+chmod 700 "$WORK_TMP"
+trap 'rm -rf "${WORK_TMP:?}"' EXIT
+
 if [[ "$MODE" == "rollback" ]]; then
   confirm "Tornare alla versione in ${OLD_DIR}?" || exit 0
   do_rollback
@@ -173,6 +186,27 @@ on_error() {
 }
 trap on_error ERR
 
+# ---- Spazio su disco ----
+# Servono circa: staging del backup + archivio + copia di data/ + nuova versione (~1.5 GB)
+DATA_KB=0
+for d in "${KEEP_DATA[@]}"; do
+  if [[ -e "${APP_DIR}/${d}" ]]; then
+    DATA_KB=$((DATA_KB + $(du -sk "${APP_DIR}/${d}" | cut -f1)))
+  fi
+done
+for x in "${EXCLUDE_DATA[@]}"; do
+  if [[ -e "${APP_DIR}/${x}" ]]; then
+    DATA_KB=$((DATA_KB - $(du -sk "${APP_DIR}/${x}" | cut -f1)))
+  fi
+done
+NEED_KB=$((DATA_KB * 3 + 1536000))
+FREE_KB="$(df -Pk "/home/${APP_USER}" | awk 'NR==2 {print $4}')"
+echo " Dati da copiare: $((DATA_KB / 1024)) MB, spazio necessario ~$((NEED_KB / 1024)) MB, libero $((FREE_KB / 1024)) MB"
+if (( FREE_KB < NEED_KB )); then
+  warn "Spazio su disco insufficiente: libera spazio (vecchi backup, cartelle OpenWA_failed_*) e riprova."
+  exit 1
+fi
+
 # ---- 1. Nuova versione ----
 log "Clono ${REF} in ${NEW_DIR}..."
 rm -rf "$NEW_DIR"
@@ -198,11 +232,21 @@ mkdir -p "$BACKUP_DIR"
 chown "$APP_USER": "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 if [[ -x "${APP_DIR}/scripts/backup.sh" ]]; then
-  as_app "cd '${APP_DIR}' && BACKUP_DIR='${BACKUP_DIR}' ./scripts/backup.sh"
+  # Le cartelle escluse non entrano nemmeno nel backup: backup.sh salta le sessioni
+  # se SESSION_DATA_PATH punta a una cartella inesistente.
+  SKIP_ENV=""
+  for x in "${EXCLUDE_DATA[@]}"; do
+    if [[ "$x" == "data/sessions" ]]; then
+      SKIP_ENV="SESSION_DATA_PATH='${WORK_TMP}/nessuna-sessione'"
+    fi
+  done
+  as_app "cd '${APP_DIR}' && ${SKIP_ENV} BACKUP_DIR='${BACKUP_DIR}' ./scripts/backup.sh"
 else
   # versioni precedenti alla 0.19.0 non hanno backup.sh
   ARCHIVE="${BACKUP_DIR}/openwa-backup-$(date +%Y%m%d-%H%M%S)-data.tar.gz"
-  as_app "cd '${APP_DIR}' && tar -czf '${ARCHIVE}' data .env"
+  EXCL_ARGS=()
+  for x in "${EXCLUDE_DATA[@]}"; do EXCL_ARGS+=("--exclude=./${x}"); done
+  as_app "cd '${APP_DIR}' && tar ${EXCL_ARGS[*]} -czf '${ARCHIVE}' ./data ./.env"
   echo "    ${ARCHIVE}"
 fi
 
@@ -210,23 +254,14 @@ log "Tengo solo gli ultimi ${KEEP_BACKUPS} backup..."
 ls -1t "${BACKUP_DIR}"/openwa-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f -- || true
 
 # ---- 3. Dati ----
-NEED_KB=0
-for d in "${KEEP_DATA[@]}"; do
-  if [[ -e "${APP_DIR}/${d}" ]]; then
-    NEED_KB=$((NEED_KB + $(du -sk "${APP_DIR}/${d}" | cut -f1)))
-  fi
-done
-FREE_KB="$(df -Pk "$(dirname "$APP_DIR")" | awk 'NR==2 {print $4}')"
-if (( FREE_KB < NEED_KB + 512000 )); then
-  warn "Spazio insufficiente: servono circa $((NEED_KB / 1024)) MB + margine, liberi $((FREE_KB / 1024)) MB."
-  false
-fi
-
-log "Copio i dati (storico, sessioni, database, media, plugin)..."
+log "Copio i dati (storico, database, media, plugin)..."
+for x in "${EXCLUDE_DATA[@]}"; do echo "    escluso: ${x}"; done
 for d in "${KEEP_DATA[@]}"; do
   if [[ -e "${APP_DIR}/${d}" ]]; then
     rm -rf "${NEW_DIR:?}/${d}"
-    cp -a "${APP_DIR}/${d}" "${NEW_DIR}/${d}"
+    EXCL_ARGS=()
+    for x in "${EXCLUDE_DATA[@]}"; do EXCL_ARGS+=("--exclude=./${x}"); done
+    (cd "$APP_DIR" && tar "${EXCL_ARGS[@]}" -cf - "./${d}") | (cd "$NEW_DIR" && tar -xpf -)
     echo "    ${d}"
   fi
 done
@@ -255,6 +290,14 @@ if ! pm2_restart_from "$APP_DIR" || ! wait_healthy "$APP_DIR"; then
   exit 1
 fi
 
+# Le cartelle escluse non servono piu' nemmeno in OpenWA_old: libero spazio
+for x in "${EXCLUDE_DATA[@]}"; do
+  if [[ -e "${OLD_DIR}/${x}" ]]; then
+    log "Libero spazio: elimino ${OLD_DIR}/${x}"
+    rm -rf "${OLD_DIR:?}/${x}"
+  fi
+done
+
 echo ""
 echo "======================================================"
 echo " Aggiornamento completato: ${CURRENT_VERSION} -> $(app_version "$APP_DIR")"
@@ -262,7 +305,7 @@ echo " Versione attiva:     ${APP_DIR}"
 echo " Versione precedente: ${OLD_DIR}"
 echo " Backup:              ${BACKUP_DIR}"
 echo ""
-echo " Controlla che le sessioni si siano riconnesse:"
+echo " Le sessioni WhatsApp vanno riabbinate: apri la dashboard e scansiona il QR."
 echo "   su - ${APP_USER} -c 'pm2 logs ${PM2_APP_NAME}'"
 echo "   curl -H \"X-API-Key: \$API_KEY\" http://127.0.0.1:$(app_port "$APP_DIR")/api/sessions"
 echo ""
